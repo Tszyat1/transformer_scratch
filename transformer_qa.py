@@ -45,19 +45,29 @@ class MultiHeadAttention(nn.Module):
             nn.init.xavier_uniform_(m.weight, gain=1 / math.sqrt(2))
 
     def forward(self, query, key, value, mask=None):
+        """
+        query/key/value: (B, L, D)
+        mask: (B, L) with 1 for keep, 0 for mask out (same convention as attention_mask)
+        """
         bsz, seqlen, _ = query.size()
-        Q = self.w_q(query).view(bsz, seqlen, self.n_heads, self.d_k).transpose(1, 2)
-        K = self.w_k(key).view(bsz, -1,     self.n_heads, self.d_k).transpose(1, 2)
-        V = self.w_v(value).view(bsz, -1,   self.n_heads, self.d_k).transpose(1, 2)
 
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        # Project
+        Q = self.w_q(query).view(bsz, seqlen, self.n_heads, self.d_k).transpose(1, 2)  # (B,H,L,Dk)
+        K = self.w_k(key  ).view(bsz, seqlen, self.n_heads, self.d_k).transpose(1, 2)
+        V = self.w_v(value).view(bsz, seqlen, self.n_heads, self.d_k).transpose(1, 2)
+
+        # Scores (compute and softmax in fp32 for AMP stability)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale          # (B,H,L,L)
+        scores_f32 = scores.float()
         if mask is not None:
-            mask = mask.unsqueeze(1).unsqueeze(1)  # (bsz,1,1,seqlen)
-            scores.masked_fill_(mask == 0, -1e9)
+            # broadcast mask to (B,1,1,L) ; 1=keep, 0=mask
+            mask4d = mask.unsqueeze(1).unsqueeze(1)
+            scores_f32 = scores_f32.masked_fill(mask4d == 0, -1e4)
 
-        attn = torch.softmax(scores, dim=-1)
+        attn = torch.softmax(scores_f32, dim=-1).to(Q.dtype)
         attn = self.dropout(attn)
-        ctx = torch.matmul(attn, V)
+
+        ctx = torch.matmul(attn, V)  # (B,H,L,Dk)
         ctx = ctx.transpose(1, 2).contiguous().view(bsz, seqlen, self.d_model)
         return self.w_o(ctx)
 
@@ -90,7 +100,8 @@ class TransformerEncoderLayer(nn.Module):
         return x
 
 class TransformerQA(nn.Module):
-    """Transformer encoder (from scratch) + QA heads (start/end)."""
+    """Transformer encoder (from scratch) + QA heads (start/end).
+       Use [CLS] (index 0) as the null span for SQuAD v2."""
     def __init__(self, vocab_size, d_model=256, n_heads=8, n_layers=4,
                  d_ff=1024, max_len=384, dropout=0.1):
         super().__init__()
@@ -99,11 +110,13 @@ class TransformerQA(nn.Module):
         self.posenc = PositionalEncoding(d_model, max_len=max_len, dropout=dropout)
         self.layers = nn.ModuleList([
             TransformerEncoderLayer(d_model, n_heads, d_ff, dropout)
-            for _ in range(n_layers)
-        ])
-        self.qa_outputs = nn.Linear(d_model, 2)
+        for _ in range(n_layers)])
         self.dropout = nn.Dropout(dropout)
 
+        # Heads
+        self.qa_outputs = nn.Linear(d_model, 2)  # start/end
+
+        # inits
         nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.token_type_embedding.weight, mean=0.0, std=0.02)
         nn.init.xavier_uniform_(self.qa_outputs.weight)
@@ -114,7 +127,6 @@ class TransformerQA(nn.Module):
             x = x + self.token_type_embedding(token_type_ids)
         x = x * math.sqrt(x.size(-1))
 
-        # transformer expects (seq_len, batch, dim) for our posenc
         x = x.transpose(0, 1)
         x = self.posenc(x)
         x = x.transpose(0, 1)
@@ -122,6 +134,7 @@ class TransformerQA(nn.Module):
         for layer in self.layers:
             x = layer(x, attention_mask)
 
-        logits = self.qa_outputs(self.dropout(x))
+        h = self.dropout(x)
+        logits = self.qa_outputs(h)
         start_logits, end_logits = logits[..., 0], logits[..., 1]
         return start_logits, end_logits
