@@ -1,51 +1,53 @@
-# evaluate.py
+#!/usr/bin/env python3
 """
-Evaluation for SQuAD v1.1/v2.0-style extractive QA.
-- windowed decoding (doc stride) with small batching for speed
-- v2 "no-answer" via tuned threshold on (null_score - best_span_score)
-- F1/EM with standard normalization
+Fast evaluator for SQuAD v2-style extractive QA models.
+
+- Runs the model ONCE to collect, for each question:
+    * best non-null span text and score (start+end logits)
+    * null score (CLS-based or explicit null logit)
+- Then sweeps null-thresholds WITHOUT doing more inference.
+
+Usage example:
+  python evaluate.py \
+    --model outputs/transformer_qa_636008719.pth \
+    --data dev-v2.0.json \
+    --tok_dir ./bert-base-uncased \
+    --window_batch_size 16 \
+    --tune_threshold \
+    --thr_start -15 --thr_end 15 --thr_step 0.5
 """
-import os, json, argparse, string, re
-from collections import Counter
+
+import argparse, json, math, string, re, sys, os
+from collections import Counter, defaultdict
 
 import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer
+
+# ---- import your model ---
 from transformer_qa import TransformerQA
 
-def check_gpu():
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        print(f"✓ GPU AVAILABLE: {torch.cuda.get_device_name(0)}")
-    else:
-        device = torch.device("cpu")
-        print("✗ GPU not available, using CPU")
-    return device
-
-DEVICE = check_gpu()
-
-# -------- SQuAD scoring helpers (official-style normalization) --------
-# HF docs mirror this normalization for QA. :contentReference[oaicite:1]{index=1}
-def normalize_answer(s):
+# ----------------- utils -----------------
+def normalize_answer(s: str) -> str:
+    """Lower text and remove punctuation, articles and extra whitespace."""
     def remove_articles(text): return re.sub(r"\b(a|an|the)\b", " ", text)
-    def white_space_fix(text): return " ".join(text.split())
-    def remove_punc(text):
-        exclude = set(string.punctuation)
-        return "".join(ch for ch in text if ch not in exclude)
-    def lower(text): return text.lower()
+    def white_space_fix(text):  return " ".join(text.split())
+    def remove_punc(text):      return "".join(ch for ch in text if ch not in set(string.punctuation))
+    def lower(text):            return text.lower()
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
-def f1_score(prediction, ground_truth):
-    pred_tokens  = normalize_answer(prediction).split()
-    gold_tokens  = normalize_answer(ground_truth).split()
-    common = Counter(pred_tokens) & Counter(gold_tokens)
+def f1_score(prediction: str, ground_truth: str) -> float:
+    pred_tokens = normalize_answer(prediction).split()
+    gt_tokens   = normalize_answer(ground_truth).split()
+    common = Counter(pred_tokens) & Counter(gt_tokens)
     num_same = sum(common.values())
-    if num_same == 0: return 0.0
-    precision = num_same / max(1, len(pred_tokens))
-    recall    = num_same / max(1, len(gold_tokens))
-    return 2 * precision * recall / (precision + recall)
+    if num_same == 0:
+        return 0.0
+    precision = num_same / max(len(pred_tokens), 1)
+    recall    = num_same / max(len(gt_tokens), 1)
+    return 2 * precision * recall / max(precision + recall, 1e-8)
 
-def exact_match_score(prediction, ground_truth):
+def exact_match_score(prediction: str, ground_truth: str) -> bool:
     return normalize_answer(prediction) == normalize_answer(ground_truth)
 
 def evaluate_predictions(predictions, data_path):
@@ -53,201 +55,279 @@ def evaluate_predictions(predictions, data_path):
         data = json.load(f)
 
     f1s, ems = [], []
+    has_ids, no_ids = set(), set()
+
     for article in data["data"]:
-        for paragraph in article["paragraphs"]:
-            for qa in paragraph["qas"]:
+        for para in article["paragraphs"]:
+            for qa in para["qas"]:
+                qid = qa["id"]
+                if qa.get("is_impossible", False):
+                    no_ids.add(qid)
+                else:
+                    has_ids.add(qid)
+                if qid not in predictions:
+                    continue
+                pred = predictions[qid]
+                gts = [a["text"] for a in qa.get("answers", [])] or [""]
+                f1s.append(max(f1_score(pred, gt) for gt in gts))
+                ems.append(max(exact_match_score(pred, gt) for gt in gts))
+
+    n_all = len(f1s)
+    avg_f1 = 100 * (sum(f1s) / n_all if n_all else 0.0)
+    avg_em = 100 * (sum(ems) / n_all if n_all else 0.0)
+
+    # Split metrics for has/no-answer to help debugging
+    has_f1 = []
+    has_em = []
+    no_em  = []
+    for article in data["data"]:
+        for para in article["paragraphs"]:
+            for qa in para["qas"]:
                 qid = qa["id"]
                 if qid not in predictions:
                     continue
                 pred = predictions[qid]
-                if qa.get("answers"):
-                    gts = [a["text"] for a in qa["answers"]]
+                gts  = [a["text"] for a in qa.get("answers", [])] or [""]
+                if qa.get("is_impossible", False):
+                    no_em.append(max(exact_match_score(pred, gt) for gt in gts))
                 else:
-                    gts = [""]  # v2 no-answer ground truth
-                f1 = max(f1_score(pred, gt) for gt in gts)
-                em = max(exact_match_score(pred, gt) for gt in gts)
-                f1s.append(f1); ems.append(em)
+                    has_f1.append(max(f1_score(pred, gt) for gt in gts))
+                    has_em.append(max(exact_match_score(pred, gt) for gt in gts))
 
-    avg_f1 = 100 * (sum(f1s) / max(1, len(f1s)))
-    avg_em = 100 * (sum(ems) / max(1, len(ems)))
-    return avg_f1, avg_em
+    def pct(x): return 100 * (sum(x) / len(x)) if x else 0.0
+    split = {
+        "n_all": n_all,
+        "n_has": len(has_ids),
+        "n_no":  len(no_ids),
+        "has_f1": pct(has_f1),
+        "has_em": pct(has_em),
+        "no_em":  pct(no_em),
+    }
+    return avg_f1, avg_em, split
 
-# -------- Span search over windows + null handling --------
-# Mirrors HF examples: compare best span vs null with a tunable threshold. :contentReference[oaicite:2]{index=2}
-def best_span_per_item(start_logits, end_logits, token_type_ids, max_len, topk=50):
-    # Restrict to context tokens only
-    ctx = (token_type_ids == 1)
-    s = start_logits.clone(); s[~ctx] = -1e9
-    e = end_logits.clone();   e[~ctx] = -1e9
+# ----------------- model loading -----------------
+def load_model_state(model, ckpt_path, device):
+    ckpt = torch.load(ckpt_path, map_location=device)
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        # our training script saved a dict with extra metadata
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    elif isinstance(ckpt, dict):
+        # plain state dict
+        model.load_state_dict(ckpt, strict=False)
+    else:
+        raise ValueError("Unknown checkpoint format")
+    return model
 
-    k = min(len(s), topk)
-    s_idx = torch.topk(s, k).indices
-    e_idx = torch.topk(e, k).indices
-
-    best = (-1e9, 0, 0)
-    for si in s_idx:
-        for ei in e_idx:
-            si, ei = int(si), int(ei)
-            if ei < si or (ei - si + 1) > max_len:
-                continue
-            score = s[si].item() + e[ei].item()
-            if score > best[0]:
-                best = (score, si, ei)
-    return best  # (score, sidx, eidx)
-
-def get_per_question_candidates(model, data_path, tokenizer,
-                                max_len=384, stride=128, window_batch_size=16, max_answer_length=30):
+# ----------------- span search -----------------
+def best_span_from_logits(start_log, end_log, token_type_ids, offsets, max_answer_len=30):
     """
-    For each question, compute:
-      - best_non_null_score and its span text (across windows)
-      - best null_score (CLS) across windows
-    Returns dict: qid -> (diff=null-best, text=best_span_text)
+    Returns (best_score, (start_idx, end_idx)) constrained to context tokens (token_type_id==1),
+    ignoring special tokens with offset (0,0).
+    """
+    # find where context begins
+    ctx_start = 0
+    for i, t in enumerate(token_type_ids):
+        if t == 1:
+            ctx_start = i
+            break
+
+    L = len(start_log)
+    best_score = -1e30
+    best_s, best_e = 0, 0
+
+    # Simply brute-force up to max_answer_len; L is small (<=384)
+    for s in range(ctx_start, L):
+        if offsets[s][1] == 0:  # special token
+            continue
+        # end cannot be before start, and cap by max length
+        e_max = min(L - 1, s + max_answer_len - 1)
+        for e in range(s, e_max + 1):
+            if offsets[e][1] == 0:
+                continue
+            score = start_log[s] + end_log[e]
+            if score > best_score:
+                best_score, best_s, best_e = score, s, e
+    return best_score, (best_s, best_e)
+
+def tokens_to_text(tokenizer, input_ids, start_idx, end_idx):
+    toks = tokenizer.convert_ids_to_tokens(input_ids[start_idx:end_idx+1])
+    text = tokenizer.convert_tokens_to_string(toks).strip()
+    # clean artifacts
+    return text.replace("[CLS]", "").replace("[SEP]", "").strip()
+
+# ----------------- candidate collection -----------------
+@torch.inference_mode()
+def collect_candidates(model, tokenizer, data_path, device, max_len=384, stride=128, window_batch_size=16, max_answer_len=30):
+    """
+    One full pass. For each QID, keep:
+      - best non-null text and score
+      - null score
+    Returns: dict[qid] = {"best_text": str, "best_score": float, "null_score": float}
     """
     model.eval()
-    per_q = {}
-
     with open(data_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        dataset = json.load(f)
 
-    with torch.no_grad():
-        for article in tqdm(data["data"], desc="Evaluating"):
-            for paragraph in article["paragraphs"]:
-                context = paragraph["context"]
-                for qa in paragraph["qas"]:
-                    qid = qa["id"]; question = qa["question"]
+    results = {}
+    # Iterate by article for a stable progress-bar (35 for SQuAD dev)
+    for article in tqdm(dataset["data"], desc="Evaluating", leave=False):
+        for para in article["paragraphs"]:
+            context = para["context"]
+            for qa in para["qas"]:
+                qid = qa["id"]
+                question = qa["question"]
 
-                    enc = tokenizer(
-                        question, context,
-                        truncation="only_second",
-                        max_length=max_len,
-                        stride=stride,
-                        return_overflowing_tokens=True,
-                        padding="max_length",
-                        return_tensors="pt",
-                        return_token_type_ids=True
-                    )
+                # Tokenize into sliding windows
+                enc = tokenizer(
+                    question,
+                    context,
+                    truncation="only_second",
+                    max_length=max_len,
+                    stride=stride,
+                    return_overflowing_tokens=True,
+                    return_offsets_mapping=True,
+                    return_token_type_ids=True,
+                    padding="max_length"
+                )
+                n = len(enc["input_ids"])
+                best_text = ""
+                best_score = -1e30
+                null_score_global = -1e30
 
-                    # process windows in small batches for speed
-                    W = enc["input_ids"].size(0)
-                    best_overall = (-1e9, None, None, None)  # (score, s, e, tokens)
-                    null_overall = -1e9
+                # batched windows
+                for i0 in range(0, n, window_batch_size):
+                    i1 = min(n, i0 + window_batch_size)
+                    batch = {k: torch.tensor(enc[k][i0:i1]).to(device) for k in ["input_ids","attention_mask","token_type_ids"]}
+                    offsets_batch = enc["offset_mapping"][i0:i1]
 
-                    for start in range(0, W, window_batch_size):
-                        end = min(W, start + window_batch_size)
-                        input_ids = enc["input_ids"][start:end].to(DEVICE)
-                        attn      = enc["attention_mask"][start:end].to(DEVICE)
-                        ttids     = enc["token_type_ids"][start:end].to(DEVICE)
-
-                        start_logits, end_logits = model(input_ids, attn, ttids)
-
-                        for i in range(end - start):
-                            s_logits = start_logits[i]; e_logits = end_logits[i]
-                            tt = ttids[i].cpu()
-                            ids = input_ids[i].cpu().tolist()
-
-                            # null score at CLS (index 0)
-                            null_score = (s_logits[0] + e_logits[0]).item()
-                            if null_score > null_overall:
-                                null_overall = null_score
-
-                            score, sidx, eidx = best_span_per_item(s_logits, e_logits, tt, max_answer_length)
-                            if score > best_overall[0]:
-                                toks = tokenizer.convert_ids_to_tokens(ids)
-                                best_overall = (score, sidx, eidx, toks)
-
-                    # compute per-question diff and best span text
-                    if best_overall[1] is None:
-                        span_text = ""
-                        best_score = -1e9
+                    out = model(batch["input_ids"], batch["attention_mask"], batch["token_type_ids"])
+                    if isinstance(out, tuple) and len(out) == 3:
+                        start_logits, end_logits, null_logits = out
+                        null_vec = null_logits  # shape [B]
                     else:
-                        sidx, eidx, toks = best_overall[1], best_overall[2], best_overall[3]
-                        span_text = tokenizer.convert_tokens_to_string(toks[sidx:eidx+1]).strip()
-                        span_text = span_text.replace("[CLS]", "").replace("[SEP]", "").strip()
-                        best_score = best_overall[0]
+                        start_logits, end_logits = out
+                        # CLS is index 0
+                        null_vec = start_logits[:, 0] + end_logits[:, 0]
 
-                    diff = null_overall - best_score
-                    per_q[qid] = (diff, span_text)
-    return per_q
+                    # Move to CPU numpy for easy loops
+                    start_np = start_logits.detach().float().cpu().numpy()
+                    end_np   = end_logits.detach().float().cpu().numpy()
+                    null_np  = null_vec.detach().float().cpu().numpy()
+                    input_ids_batch = batch["input_ids"].detach().cpu().tolist()
+                    ttids_batch     = batch["token_type_ids"].detach().cpu().tolist()
 
-def apply_threshold(per_q, threshold):
-    return {qid: ("" if diff > threshold else text) for qid, (diff, text) in per_q.items()}
+                    for b in range(i1 - i0):
+                        null_score_global = max(null_score_global, float(null_np[b]))
+                        score, (s_idx, e_idx) = best_span_from_logits(
+                            start_np[b], end_np[b], ttids_batch[b], offsets_batch[b], max_answer_len
+                        )
+                        if score > best_score:
+                            best_score = float(score)
+                            best_text  = tokens_to_text(tokenizer, input_ids_batch[b], s_idx, e_idx)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, required=True, help="Path to checkpoint (.pth)")
-    parser.add_argument("--data",  type=str, default="dev-v2.0.json")
-    parser.add_argument("--tok_dir", type=str, default="./bert-base-uncased",
-                        help="Local tokenizer dir (offline).")
-    parser.add_argument("--max_len", type=int, default=384)
-    parser.add_argument("--stride",  type=int, default=128)
-    parser.add_argument("--max_answer_length", type=int, default=30)
-    parser.add_argument("--window_batch_size", type=int, default=16,
-                        help="Number of windows per forward pass for speed.")
-    parser.add_argument("--tune_threshold", action="store_true",
-                        help="Sweep null threshold on dev to maximize F1.")
-    parser.add_argument("--tune_start", type=float, default=-10.0)
-    parser.add_argument("--tune_end",   type=float, default=20.0)
-    parser.add_argument("--tune_step",  type=float, default=0.5)
-    parser.add_argument("--use_threshold", type=float, default=0.0,
-                        help="If not tuning, use this fixed threshold.")
-    args = parser.parse_args()
+                # if no valid non-null found, keep empty with very low score
+                results[qid] = {
+                    "best_text": best_text,
+                    "best_score": best_score,
+                    "null_score": null_score_global
+                }
+    return results
 
+# ----------------- threshold sweep (cheap) -----------------
+def predict_with_threshold(candidates, threshold: float):
+    """
+    Apply HF-style rule once candidates are cached:
+      empty if null_score > best_score + threshold  (SQuAD v2) 
+    """
+    preds = {}
+    empty = 0
+    lengths = []
+    for qid, rec in candidates.items():
+        if rec["null_score"] > (rec["best_score"] + threshold):
+            preds[qid] = ""
+            empty += 1
+        else:
+            preds[qid] = rec["best_text"]
+            lengths.append(len(rec["best_text"].split()))
+    empty_pct = 100.0 * empty / max(len(candidates), 1)
+    avg_span = sum(lengths) / max(len(lengths), 1) if lengths else 0.0
+    return preds, empty_pct, avg_span
+
+# ----------------- main -----------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", type=str, required=True, help="Path to model checkpoint (.pth)")
+    ap.add_argument("--data", type=str, default="dev-v2.0.json")
+    ap.add_argument("--tok_dir", type=str, default="bert-base-uncased")
+    ap.add_argument("--max_len", type=int, default=384)
+    ap.add_argument("--stride", type=int, default=128)
+    ap.add_argument("--max_answer_length", type=int, default=30)
+    ap.add_argument("--window_batch_size", type=int, default=16)
+    ap.add_argument("--threshold", type=float, default=0.0, help="Used if --tune_threshold is not set")
+    ap.add_argument("--tune_threshold", action="store_true", help="Grid-search threshold AFTER a single model pass")
+    ap.add_argument("--thr_start", type=float, default=-15.0)
+    ap.add_argument("--thr_end", type=float, default=15.0)
+    ap.add_argument("--thr_step", type=float, default=0.5)
+    args = ap.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Loading model...")
-    ckpt = torch.load(args.model, map_location=DEVICE)
-    cfg = ckpt["config"]
+
     tokenizer = AutoTokenizer.from_pretrained(args.tok_dir, local_files_only=True)
 
+    # Build model with typical defaults used in training (adapt if yours differ)
     model = TransformerQA(
-        vocab_size=ckpt["vocab_size"],
-        d_model=cfg["d_model"], n_heads=cfg["n_heads"],
-        n_layers=cfg["n_layers"], d_ff=cfg["d_ff"],
-        max_len=cfg["max_len"], dropout=cfg.get("dropout", 0.0)
-    ).to(DEVICE)
-    model.load_state_dict(ckpt["model_state_dict"])
+        vocab_size=tokenizer.vocab_size,
+        d_model=256, n_heads=8, n_layers=4, d_ff=1024, max_len=args.max_len, dropout=0.0
+    ).to(device)
+    load_model_state(model, args.model, device)
     model.eval()
 
-    print("Getting per-question candidates (batched windows)...")
-    per_q = get_per_question_candidates(
-        model, args.data, tokenizer,
+    print("Collecting per-question candidates (one model pass)...")
+    candidates = collect_candidates(
+        model, tokenizer, args.data, device,
         max_len=args.max_len, stride=args.stride,
         window_batch_size=args.window_batch_size,
-        max_answer_length=args.max_answer_length
+        max_answer_len=args.max_answer_length,
     )
 
-    # tune or use fixed threshold
     if args.tune_threshold:
-        best = (-1.0, None, None)  # (F1, threshold, EM)
-        T = args.tune_start
-        thresholds = []
-        while T <= args.tune_end + 1e-9:
-            thresholds.append(round(T, 4))
-            T += args.tune_step
-
-        print(f"Tuning null threshold over {len(thresholds)} values...")
-        for th in thresholds:
-            preds = apply_threshold(per_q, th)
-            f1, em = evaluate_predictions(preds, args.data)
+        print(f"Tuning null threshold from {args.thr_start} to {args.thr_end} step {args.thr_step} ...")
+        best = (-1.0, -1.0, None, None)  # (F1, EM, thr, dbg)
+        thr = args.thr_start
+        while thr <= args.thr_end + 1e-9:
+            preds, empty_pct, avg_span = predict_with_threshold(candidates, thr)
+            f1, em, split = evaluate_predictions(preds, args.data)
             if f1 > best[0]:
-                best = (f1, th, em)
-        tuned_T = best[1]
-        print(f"[TUNED] best_null_threshold={tuned_T:.2f}  F1={best[0]:.2f}%  EM={best[2]:.2f}%")
-        final_preds = apply_threshold(per_q, tuned_T)
+                best = (f1, em, thr, (empty_pct, avg_span, split))
+            thr += args.thr_step
+
+        f1, em, thr, (empty_pct, avg_span, split) = best
+        print(f"[TUNED] best_null_threshold={thr:.2f}  F1={f1:.2f}%  EM={em:.2f}%")
+        print(f"HasAns F1: {split['has_f1']:.2f}%   HasAns EM: {split['has_em']:.2f}%")
+        print(f"NoAns EM:  {split['no_em']:.2f}%")
+        print(f"[DBG] empty%={empty_pct:.2f}%  avg_span_tokens≈{avg_span:.1f}  "
+              f"(n_all={split['n_all']}  n_has={split['n_has']}  n_no={split['n_no']})")
+
+        # Save final predictions at tuned threshold
+        preds, _, _ = predict_with_threshold(candidates, thr)
     else:
-        final_preds = apply_threshold(per_q, args.use_threshold)
-
-    print("Calculating scores...")
-    f1, em = evaluate_predictions(final_preds, args.data)
-    empty = sum(1 for v in final_preds.values() if v == "")
-    avg_len = sum(len(p.split()) for p in final_preds.values()) / max(1, len(final_preds))
-
-    print("\n" + "="*40)
-    print("EVALUATION RESULTS")
-    print("="*40)
-    print(f"F1 Score: {f1:.2f}%")
-    print(f"Exact Match: {em:.2f}%")
-    print(f"[DBG] empty%={empty/len(final_preds):.2%}  avg_span_tokens≈{avg_len:.1f}")
-    print("="*40)
+        preds, empty_pct, avg_span = predict_with_threshold(candidates, args.threshold)
+        f1, em, split = evaluate_predictions(preds, args.data)
+        print("\n========================================")
+        print("EVALUATION RESULTS")
+        print("========================================")
+        print(f"F1 Score: {f1:.2f}%")
+        print(f"Exact Match: {em:.2f}%")
+        print(f"HasAns F1: {split['has_f1']:.2f}%   HasAns EM: {split['has_em']:.2f}%")
+        print(f"NoAns EM:  {split['no_em']:.2f}%")
+        print(f"[DBG] empty%={empty_pct:.2f}%  avg_span_tokens≈{avg_span:.1f}  "
+              f"(n_all={split['n_all']}  n_has={split['n_has']}  n_no={split['n_no']})")
+        print("========================================")
 
     with open("predictions.json", "w", encoding="utf-8") as f:
-        json.dump(final_preds, f, indent=2, ensure_ascii=False)
+        json.dump(preds, f, indent=2, ensure_ascii=False)
     print("Predictions saved to predictions.json")
+
+if __name__ == "__main__":
+    main()
